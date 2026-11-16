@@ -4,6 +4,7 @@ import com.mdm.platform.repository.JdbcSupport;
 import com.mdm.platform.service.CompatibilityService;
 import com.mdm.platform.service.ImpactAnalysisService;
 import com.mdm.platform.service.IngestionService;
+import com.mdm.platform.service.ReliabilityService;
 import com.mdm.platform.service.ReleaseGateService;
 import com.mdm.platform.service.SnapshotService;
 import org.slf4j.Logger;
@@ -39,6 +40,7 @@ public class DemoDataInitializer implements ApplicationRunner {
     private final ReleaseGateService releaseGateService;
     private final IngestionService ingestionService;
     private final ImpactAnalysisService impactAnalysisService;
+    private final ReliabilityService reliabilityService;
 
     @Value("${app.demo.auto-init:true}")
     private boolean autoInit;
@@ -51,7 +53,8 @@ public class DemoDataInitializer implements ApplicationRunner {
                                CompatibilityService compatibilityService,
                                ReleaseGateService releaseGateService,
                                IngestionService ingestionService,
-                               ImpactAnalysisService impactAnalysisService) {
+                               ImpactAnalysisService impactAnalysisService,
+                               ReliabilityService reliabilityService) {
         this.dataSource = dataSource;
         this.db = db;
         this.snapshotService = snapshotService;
@@ -59,6 +62,7 @@ public class DemoDataInitializer implements ApplicationRunner {
         this.releaseGateService = releaseGateService;
         this.ingestionService = ingestionService;
         this.impactAnalysisService = impactAnalysisService;
+        this.reliabilityService = reliabilityService;
     }
 
     @Override
@@ -80,12 +84,27 @@ public class DemoDataInitializer implements ApplicationRunner {
                     ScriptUtils.executeSqlScript(conn, new ClassPathResource("db/seed.sql"));
                 }
             }
+        } else {
+            // 老库升级：schema.sql 全部为 IF NOT EXISTS，可在每个启动周期幂等补齐新表
+            try (Connection conn = dataSource.getConnection()) {
+                ScriptUtils.executeSqlScript(conn, new ClassPathResource("db/schema.sql"));
+            }
+        }
+        // 可靠性场景种子单独成文：全新库与老库升级都在“全空”时应用一次
+        if (db.count("SELECT count(*) FROM reliability_program") == 0) {
+            log.info("应用可靠性对比场景种子 seed_reliability.sql ...");
+            try (Connection conn = dataSource.getConnection()) {
+                ScriptUtils.executeSqlScript(conn, new ClassPathResource("db/seed_reliability.sql"));
+            }
         }
         if (db.count("SELECT count(*) FROM config_snapshot") > 0) {
             log.info("派生样例已存在，跳过场景重放");
-            return;
+        } else {
+            replayScenarios();
         }
-        replayScenarios();
+        if (db.count("SELECT count(*) FROM reliability_report") == 0) {
+            replayReliabilityScenarios();
+        }
     }
 
     private void truncateAll(Connection conn) throws Exception {
@@ -93,6 +112,8 @@ public class DemoDataInitializer implements ApplicationRunner {
                 "conflict_fact","snapshot_position","config_snapshot","rule_constraint","substitution_rule",
                 "inspection_record","factory_record","install_event","drawing_revision","drawing",
                 "entity_alias_candidate","master_entity","ingestion_contract_version","ingestion_contract",
+                "reliability_report_event","reliability_risk_comparison","reliability_report_stratum",
+                "reliability_report","reliability_segment","failure_ticket","reliability_program",
                 "app_user"};
         try (var st = conn.createStatement()) {
             for (String t : tables) {
@@ -194,9 +215,40 @@ public class DemoDataInitializer implements ApplicationRunner {
         // 图号修订影响分析（场景A 配套）
         impactAnalysisService.analyzeDrawingChange(2L);
 
-        log.info("==== 五大场景重放完成，共生成快照 {} 个，兼容事实 {} 条，质量事件 {} 条 ====",
+        replayReliabilityScenarios();
+
+        log.info("==== 五大场景重放完成，共生成快照 {} 个，兼容事实 {} 条，质量事件 {} 条，可靠性报告 {} 份 ====",
                 db.count("SELECT count(*) FROM config_snapshot"),
                 db.count("SELECT count(*) FROM compatibility_fact"),
-                db.count("SELECT count(*) FROM quality_event"));
+                db.count("SELECT count(*) FROM quality_event"),
+                db.count("SELECT count(*) FROM reliability_report"));
+    }
+
+    /**
+     * 替代件可靠性对比重放（与 seed.sql 第 13 节数据配套）：
+     *  - v1：截止点 2025-09-30、接收边界 2025-08-01 -> 2025-06-20 的迟到工单尚未可见
+     *  - v2：同一截止点、纳入迟到工单 -> 旧报告保留，另发新版本
+     * 两版都覆盖：集中安装、观察不足、转装删失、重复报修、原因不明拆除、某工况缺原件（不作比较）。
+     */
+    private void replayReliabilityScenarios() {
+        log.info("==== 重放替代件可靠性对比 ====");
+        final long PROGRAM = 1;
+        OffsetDateTime cutoff = OffsetDateTime.parse("2025-09-30T00:00:00Z");
+        var v1 = reliabilityService.generateReport(new ReliabilityService.GenerateRequest(
+                PROGRAM, cutoff, OffsetDateTime.parse("2025-08-01T00:00:00Z"), "system-replay"));
+        log.info("可靠性-1: 旧接收边界报告 {} 生成（迟到工单尚未可见）",
+                ((Map<?, ?>) v1.get("report")).get("report_no"));
+        var v2 = reliabilityService.generateReport(new ReliabilityService.GenerateRequest(
+                PROGRAM, cutoff, null, "system-replay"));
+        log.info("可靠性-2: 纳入迟到工单的新版本报告 {} 生成，旧版本保留",
+                ((Map<?, ?>) v2.get("report")).get("report_no"));
+        var comparisons = (List<?>) v2.get("comparisons");
+        for (Object c : comparisons) {
+            Map<?, ?> row = (Map<?, ?>) c;
+            Object censoring = row.get("censoring_check");
+            Object verdict = censoring == null ? null : db.toMap(censoring).get("verdict");
+            log.info("可靠性-3: 工况 {} 可比={} 风险差(固定窗口)={} 删失检验={}",
+                    row.get("environment"), row.get("comparable"), row.get("risk_diff_fixed"), verdict);
+        }
     }
 }

@@ -15,6 +15,7 @@ const routes = [
       { path: 'rules', name: 'rules', component: () => import('../views/Rules.vue'), meta: { title: '替代规则与血缘' } },
       { path: 'snapshots', name: 'snapshots', component: () => import('../views/Snapshots.vue'), meta: { title: '配置快照与时点查询' } },
       { path: 'compatibility', name: 'compatibility', component: () => import('../views/Compatibility.vue'), meta: { title: '兼容事实与发布闸门' } },
+      { path: 'reliability', name: 'reliability', component: () => import('../views/Reliability.vue'), meta: { title: '替代件可靠性观察' } },
       { path: 'impact', name: 'impact', component: () => import('../views/Impact.vue'), meta: { title: '影响分析' } },
       { path: 'quality', name: 'quality', component: () => import('../views/Quality.vue'), meta: { title: '质量事件' } }
     ]

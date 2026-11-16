@@ -378,3 +378,171 @@ CREATE TABLE IF NOT EXISTS release_audit_log (
     reason              TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- =====================================================================
+-- 12. 可靠性观察段 / 故障工单 / 版本化风险报告（替代件批准后的现场对比）
+--     设计原则：
+--       1. 观察段由追加式装拆事件派生，保留装拆、工况、首发故障与删失原因
+--       2. 同一观察段只取首发故障；重复报修以 recurrence 留档但不重复计数
+--       3. 报告按截止点 + 已知接收边界版本化：迟到工单不改写旧报告，只生成新版本
+--       4. 固定随访窗口比例与 Kaplan-Meier 生存曲线并列输出，口径与删失规则显式留痕
+-- =====================================================================
+
+-- 拆卸原因：NO_FAULT_SPARE_RETURN 无故障返库 / UNKNOWN 原因不明 / TRANSFER 由后续安装推导
+ALTER TABLE install_event ADD COLUMN IF NOT EXISTS remove_reason VARCHAR(32);
+
+-- 对比项目：原件 vs 替代件 + 同一故障定义 + 指定随访期
+CREATE TABLE IF NOT EXISTS reliability_program (
+    id                     BIGSERIAL PRIMARY KEY,
+    program_code           VARCHAR(64)  NOT NULL UNIQUE,
+    program_name           VARCHAR(200) NOT NULL,
+    original_model_id      BIGINT NOT NULL REFERENCES master_entity(id),
+    replacement_model_id   BIGINT NOT NULL REFERENCES master_entity(id),
+    failure_criteria       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- {"codes":[...],"definition":"..."}
+    followup_days          INT NOT NULL DEFAULT 180 CHECK (followup_days > 0),
+    approved_at            TIMESTAMPTZ,
+    status                 VARCHAR(16) NOT NULL DEFAULT 'VERIFIED'
+                           CHECK (status IN ('DRAFT','VERIFIED','RETIRED','REVIEW')),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 观察段（派生数据：每次按截止点/接收边界重算，报告另行快照留痕）
+CREATE TABLE IF NOT EXISTS reliability_segment (
+    id                      BIGSERIAL PRIMARY KEY,
+    segment_code            VARCHAR(96) NOT NULL,              -- 段编码（按截止点/接收边界重算，可重复出现）
+    program_id              BIGINT NOT NULL REFERENCES reliability_program(id),
+    part_model_id           BIGINT NOT NULL REFERENCES master_entity(id),
+    part_role               VARCHAR(16) NOT NULL CHECK (part_role IN ('ORIGINAL','REPLACEMENT')),
+    physical_part_id        BIGINT NOT NULL REFERENCES master_entity(id),
+    equipment_id            BIGINT NOT NULL REFERENCES master_entity(id),
+    mount_position_id       BIGINT NOT NULL REFERENCES master_entity(id),
+    environment             VARCHAR(32) NOT NULL,              -- 工况：HIGH_TEMP/HUMID/STANDARD/...
+    install_event_id        BIGINT REFERENCES install_event(id),
+    installed_at            TIMESTAMPTZ NOT NULL,
+    ended_at                TIMESTAMPTZ,
+    end_kind                VARCHAR(16) NOT NULL CHECK (end_kind IN ('FAILURE','CENSORED','OPEN')),
+    censor_reason           VARCHAR(32),                       -- END_OF_CUTOFF/TRANSFER/REMOVED_NO_FAULT/UNKNOWN_REMOVAL
+    first_failure_ticket_id BIGINT,
+    observed_days           DOUBLE PRECISION NOT NULL,
+    cutoff_at               TIMESTAMPTZ NOT NULL,
+    as_of_received          TIMESTAMPTZ,
+    compiled_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    detail                  JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_rel_segment_group
+    ON reliability_segment (program_id, environment, part_role);
+CREATE INDEX IF NOT EXISTS idx_rel_segment_snapshot
+    ON reliability_segment (program_id, cutoff_at, as_of_received);
+
+-- 故障工单（只追加；事件时间与接收时间分离，迟到工单靠接收边界识别）
+CREATE TABLE IF NOT EXISTS failure_ticket (
+    id                  BIGSERIAL PRIMARY KEY,
+    ticket_no           VARCHAR(64) NOT NULL UNIQUE,
+    program_id          BIGINT REFERENCES reliability_program(id),
+    physical_part_id    BIGINT NOT NULL REFERENCES master_entity(id),
+    part_model_id       BIGINT NOT NULL REFERENCES master_entity(id),
+    equipment_id        BIGINT REFERENCES master_entity(id),
+    occurred_at         TIMESTAMPTZ NOT NULL,
+    received_at         TIMESTAMPTZ NOT NULL,
+    fault_code          VARCHAR(32) NOT NULL,
+    fault_desc          VARCHAR(255),
+    cause_category      VARCHAR(64),
+    source_ref          VARCHAR(256),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_failure_ticket_phys ON failure_ticket (physical_part_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_failure_ticket_received ON failure_ticket (received_at);
+
+-- 版本化报告头：cf. 迟到工单 -> 旧报告截止点保留，新版本另发
+CREATE TABLE IF NOT EXISTS reliability_report (
+    id                   BIGSERIAL PRIMARY KEY,
+    report_no            VARCHAR(96) NOT NULL UNIQUE,
+    program_id           BIGINT NOT NULL REFERENCES reliability_program(id),
+    version              INT NOT NULL,
+    cutoff_at            TIMESTAMPTZ NOT NULL,
+    as_of_received       TIMESTAMPTZ,
+    followup_days        INT NOT NULL,
+    supersedes_report_id BIGINT REFERENCES reliability_report(id),
+    status               VARCHAR(16) NOT NULL DEFAULT 'VERIFIED'
+                         CHECK (status IN ('DRAFT','VERIFIED','RETIRED','REVIEW')),
+    summary              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    generated_by         VARCHAR(64),
+    generated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (program_id, version)
+);
+
+-- 模型 × 环境 分层结果：固定窗口比例 + KM 风险 + 观察时间 + 删失构成
+CREATE TABLE IF NOT EXISTS reliability_report_stratum (
+    id                      BIGSERIAL PRIMARY KEY,
+    report_id               BIGINT NOT NULL REFERENCES reliability_report(id) ON DELETE CASCADE,
+    part_role               VARCHAR(16) NOT NULL,
+    part_model_id           BIGINT NOT NULL,
+    model_code              VARCHAR(96) NOT NULL,
+    environment             VARCHAR(32) NOT NULL,
+    n_segments              INT NOT NULL,
+    n_fixed_denominator     INT NOT NULL,
+    n_fixed_events          INT NOT NULL,
+    n_completed_window      INT NOT NULL,
+    risk_fixed              DOUBLE PRECISION,
+    risk_fixed_low          DOUBLE PRECISION,
+    risk_fixed_high         DOUBLE PRECISION,
+    person_days             DOUBLE PRECISION NOT NULL,
+    median_followup_days    DOUBLE PRECISION,
+    n_km_risk               INT NOT NULL,
+    km_events               INT NOT NULL,
+    km_censored             INT NOT NULL,
+    km_survival             DOUBLE PRECISION,
+    km_risk                 DOUBLE PRECISION,
+    km_risk_low             DOUBLE PRECISION,
+    km_risk_high            DOUBLE PRECISION,
+    censor_end_of_cutoff    INT NOT NULL DEFAULT 0,
+    censor_transfer         INT NOT NULL DEFAULT 0,
+    censor_removed_no_fault INT NOT NULL DEFAULT 0,
+    censor_unknown          INT NOT NULL DEFAULT 0,
+    warnings                JSONB NOT NULL DEFAULT '[]'::jsonb,
+    detail                  JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_rel_stratum_report ON reliability_report_stratum (report_id);
+
+-- 环境内 原件 vs 替代件 风险差、log-rank 与删失机制检验
+CREATE TABLE IF NOT EXISTS reliability_risk_comparison (
+    id                      BIGSERIAL PRIMARY KEY,
+    report_id               BIGINT NOT NULL REFERENCES reliability_report(id) ON DELETE CASCADE,
+    environment             VARCHAR(32) NOT NULL,
+    original_model_code     VARCHAR(96),
+    replacement_model_code  VARCHAR(96),
+    original_n              INT NOT NULL DEFAULT 0,
+    replacement_n           INT NOT NULL DEFAULT 0,
+    comparable              BOOLEAN NOT NULL DEFAULT FALSE,
+    not_comparable_reason   VARCHAR(255),
+    risk_diff_fixed         DOUBLE PRECISION,
+    risk_diff_fixed_low     DOUBLE PRECISION,
+    risk_diff_fixed_high    DOUBLE PRECISION,
+    risk_diff_km            DOUBLE PRECISION,
+    risk_diff_km_low        DOUBLE PRECISION,
+    risk_diff_km_high       DOUBLE PRECISION,
+    logrank_chi2            DOUBLE PRECISION,
+    logrank_p               DOUBLE PRECISION,
+    censoring_check         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    flags                   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    note                    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rel_comparison_report ON reliability_risk_comparison (report_id);
+
+-- 报告事件账（快照）：首发故障 / 删失 / 未完成 / 原因不明 / 重复报修 / 超定义范围
+CREATE TABLE IF NOT EXISTS reliability_report_event (
+    id              BIGSERIAL PRIMARY KEY,
+    report_id       BIGINT NOT NULL REFERENCES reliability_report(id) ON DELETE CASCADE,
+    segment_code    VARCHAR(96) NOT NULL,
+    part_role       VARCHAR(16) NOT NULL,
+    model_code      VARCHAR(96) NOT NULL,
+    environment     VARCHAR(32) NOT NULL,
+    physical_code   VARCHAR(96) NOT NULL,
+    event_type      VARCHAR(32) NOT NULL,   -- FIRST_FAILURE/CENSORED/EXCLUDED_INCOMPLETE/EXCLUDED_UNKNOWN_REMOVAL/RECURRENCE/NOT_IN_DEFINITION/OUT_OF_SEGMENT
+    event_time      TIMESTAMPTZ,
+    time_days       DOUBLE PRECISION,
+    ticket_no       VARCHAR(64),
+    reason          VARCHAR(255),
+    detail          JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_rel_event_report ON reliability_report_event (report_id);

@@ -46,7 +46,10 @@ const scenarios = [
     route: '/impact' },
   { title: 'E. 两条约束联动', tag: '最小证据链', type: 'success',
     desc: '电源 380V + 协议 EtherCAT（或 + 尺寸 2U）同时满足才 PASS；502 因尺寸 3U≠2U 判 FAIL，逐项约束进入证据链。',
-    route: '/compatibility' }
+    route: '/compatibility' },
+  { title: 'F. 替代件批准后的可比观察', tag: '风险差 + 删失检验', type: 'warning',
+    desc: '冷却泵原件 PM-PUMP-200 vs 替代件 PM-PUMP-210：同一故障定义与随访窗口，按型号×工况输出固定窗口比例、KM 生存风险与风险差；迟到工单另发新版本，原因不明拆除单列。',
+    route: '/reliability' }
 ]
 
 onMounted(async () => {
